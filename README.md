@@ -1,355 +1,190 @@
-# Flash Peripheral Driver
+# Flash Peripheral Driver - STM32H5
 
-This module provides an abstraction layer for the **internal flash memory controller** of STM32 MCUs - erase, program
-and read of the flash by the application at run time, primarily for **runtime data** (settings, calibration values,
-counters, event logs) that must survive a power cycle. It is a low-level MCAL module: the memory is described as a list
-of *areas* and the operations are independent of the area they work on, so a middleware above the module (key-value
-store, EEPROM emulation, log) is written once and works on every family.
+Flash MCAL module for the **STM32H5** family: erase, program and read of the internal flash by the application at run
+time, primarily for **runtime data**. STM32H5 has a dedicated **high-cycle data flash** (EDATA, 100 000 erase cycles,
+16-bit programming with its own ECC) that is made exactly for this purpose, so the module offers it as the area
+`FLASH_AREA_DATA`; on the lines and in the configurations where it is not enabled the data live in the user flash
+reserved by the linker (region `USER_DATA`).
 
-The public interface (`Flash_Port.h`, `Flash_Types.h`) is **identical for all supported families**. The implementation
-for a family lives in its own branch (`Dev/<Family>` for development, `Releases/<Family>` for the released versions), so
-a middleware or an application written against the interface does not change when the MCU family changes.
+The public interface (`Flash_Port.h`, `Flash_Types.h`) is the same as in all other families. The concept, the
+interface specification, the usage and the comparison of the families are in the README of the master branch of the
+repository (landing page); this README describes what is specific to STM32H5.
 
-This README is the landing page and the **specification of the interface** (master). The family branches contain their
-own README with everything that is specific to the family: supported lines, the areas of every line, configuration of
-the data area, ECC behaviour, integration with the Linker and the status of the implementation.
-
----
-
-## Intent and purpose
-
-- Many applications must keep a small amount of data in non-volatile memory and change it at run time. The internal
-  flash is the cheapest place for it, but the flash has an erase unit much bigger than the data, a limited number of
-  erase cycles and a program unit that differs from family to family.
-- Some families have a **dedicated high-cycle data flash** - a part of the flash with a much higher endurance (STM32H5:
-  100 000 erase cycles instead of 10 000) and a small program unit, made exactly for runtime data. **Not every MCU has
-  it**; the other families keep the data in ordinary user flash sectors reserved by the linker (region `USER_DATA`).
-- The module hides the difference. The application asks the module **what the memory looks like** (areas with their
-  erase unit, program unit, endurance and attributes) and uses the same four operations - erase, write, read, blank
-  check - everywhere. Whether a DATA area exists or the data live in a reserved part of the user flash is a decision of
-  the storage layer made from the area list, not a `#if` in the application.
-- The module is a **protection** as well: erase and write are accepted only inside *access windows* declared by the
-  application, so a wrong address can never destroy the program.
-
-What the module is **not**: it has no wear levelling, no power-fail safe record handling and no file system - that is
-the job of a middleware built on top of it. It does not configure the flash latency, prefetch or clocks (RCC module).
+> **Status: functionality complete, tested by unit tests only** (user story AB#1031, branch `Dev/STM32H5`). All
+> functions of the interface are implemented (blocking, polling and interrupt style) and covered by unit tests on all
+> STM32H5 lines; the integration tests on hardware are the remaining step, see
+> [Implementation status](#implementation-status).
 
 ---
 
-## Flash areas
+## Supported lines
 
-The memory is described by a list of areas. An area is a contiguous range of memory with the same properties.
+All STM32H5 lines have the same flash controller (two banks of 8 KB sectors). The device differences are handled by the
+preprocessor conditions of the ST CMSIS device headers and by the flash size register.
 
-| Area type | Meaning | Typical use |
-|---|---|---|
-| `FLASH_AREA_USER` | User flash (program memory), standard endurance. The part reserved for data (linker region `USER_DATA`) is made writable by an access window; the code is never touched. | Runtime data on families without a data flash |
-| `FLASH_AREA_DATA` | Dedicated high-cycle data flash. Higher endurance, small program unit. Exists only on families that have it and, if it has to be enabled (STM32H5: option bytes), only when it is enabled. | Frequently changed runtime data |
-| `FLASH_AREA_OTP` | One-time programmable memory, write once, no erase. | Serial numbers, calibration, keys |
-
-Every area is described by `flash_AreaInfo_t`:
-
-| Field | Meaning |
-|---|---|
-| `Type` | `FLASH_AREA_USER`, `FLASH_AREA_DATA`, `FLASH_AREA_OTP` |
-| `Bank` | Flash bank of the area (0 based). Erase and write of a bank can stall the code executed from the same bank. |
-| `Address`, `Size` | First address (memory mapped) and usable size in bytes |
-| `EraseSize` | Erase unit. Constant inside the area (areas of families with non-uniform sectors are split to uniform parts); 0 = the area can not be erased (OTP) |
-| `ProgramSize` | Program unit. Address and size of a write are multiples of it |
-| `Endurance` | Guaranteed erase cycles of one erase unit (0 = write once) |
-| `Attributes` | Bit mask: `FLASH_AREA_ATTR_ERASE_REQUIRED`, `FLASH_AREA_ATTR_ECC`, `FLASH_AREA_ATTR_WRITE_ONCE`, `FLASH_AREA_ATTR_CONFIGURABLE` (size can be changed by `Flash_Set_AreaSize`), `FLASH_AREA_ATTR_PROGRAM_BEFORE_READ` (an erased location can not be read before it is programmed - STM32H5 high-cycle data flash) |
-
-Rules valid in every family:
-
-1. **Erase** works with whole erase units: `address` and `size` are multiples of `EraseSize` of the area.
-2. **Write** works with whole program units: `address` and `size` are multiples of `ProgramSize` of the area. The
-   caller pads the record. The erased value is `FLASH_ERASED_VALUE` (0xFF) in every family.
-3. A location can be written **once after an erase**. The module checks that the destination is blank and refuses the
-   write otherwise (`FLASH_ERR_NOT_ERASED`), no register is touched. An area with the attribute
-   `FLASH_AREA_ATTR_PROGRAM_BEFORE_READ` can not be read while it is erased (the ECC reports an error), so the blank
-   check by reading is not possible there: `Flash_Get_BlankState` returns an error, the destination of a write is not
-   checked and the storage layer writes a location before it reads it.
-4. The storage layer takes the **first DATA area** of the list if there is one, otherwise a user window (see below).
-
----
-
-## Access windows
-
-`Flash_Config_t` contains a list of access windows (address, size). `Flash_Set_EraseStart` and `Flash_Set_WriteStart`
-are accepted only inside a window; reading and the blank check work everywhere inside an area.
-
-- The **default configuration** (`Flash_Get_DefaultConfig`) contains one window for every DATA area that exists, so on
-  a family with the high-cycle data flash enabled the data area works out of the box.
-- The application adds windows for data in the user flash. In the EmBi platform the Linker module reserves them: the
-  region `USER_DATA` at the end of the flash (size from the CMake variable `USER_DATA_SIZE`, a multiple of the erase
-  unit) exists in the linker script of every family and its bounds are exported as the symbols `_user_data_start`,
-  `_user_data_length` and `_user_data_end` (the symbols `_user_data_flash_start` / `_end` are different: they bound only
-  the objects placed in the section `.user_data_flash`). The export is part of the Linker task of every family story.
-- `Flash_Init` fails if a window is not aligned to the erase units of the area it lies in, or if it lies outside every
-  area. The module can not know where the code ends - choosing the window is the responsibility of the application
-  (the linker script does it).
-
----
-
-## Operation styles
-
-| Style | Behaviour |
-|---|---|
-| `FLASH_STYLE_BLOCKING` | `Flash_Set_EraseStart` / `Flash_Set_WriteStart` return when the operation is finished (or failed, or timed out). No callbacks. |
-| `FLASH_STYLE_POLLING` | The functions only start the operation and return, the operation is served by `Flash_Task()`. |
-| `FLASH_STYLE_INTERRUPT` | The functions only start the operation and return, it is served by the FLASH interrupt. |
-
-In polling and interrupt style the end of the operation is reported by `OperationCallback`, errors by `ErrorCallback`;
-both are called **only from the servicing context** (`Flash_Task` or the interrupt), never from an API function. One
-operation runs at a time - another request while busy returns `FLASH_REQUEST_ERROR`. The data buffer of a write must
-stay valid until the operation is finished. `Flash_Get_OperationState` and `Flash_Get_OperationError` can be polled
-instead of using callbacks.
-
----
-
-## Supported families
-
-Every family has its own story with the tasks of the implementation, the Linker and the tests, and its own branches
-`Dev/<Family>` and `Releases/<Family>` cut from this master.
-
-| Family | Branch | Story | Status |
+| Line | User flash | Sectors per bank | High-cycle data flash (maximum) |
 |---|---|---|---|
-| STM32H5 (all lines, with the high-cycle data flash) | `Dev/STM32H5` | AB#1031 | in progress |
-| STM32F4 | `Dev/STM32F4` | AB#1044 | planned |
-| STM32F7 | `Dev/STM32F7` | AB#1052 | planned |
-| STM32G4 | `Dev/STM32G4` | AB#1063 | planned |
-| STM32H7 (including H7R / H7S) | `Dev/STM32H7` | AB#1073 | planned |
-| STM32L4 / L4+ | `Dev/STM32L4` | AB#1081 | planned |
-| STM32U5 | `Dev/STM32U5` | AB#1089 | planned |
+| STM32H503 | 128 KB | 8 | none |
+| STM32H523, STM32H533 | 512 KB | 32 | 8 sectors per bank, 96 KB |
+| STM32H543, STM32H553 | 1 MB | 64 | 8 sectors per bank, 96 KB |
+| STM32H562, STM32H563, STM32H573 | 2 MB | 128 | 8 sectors per bank, 96 KB |
+| STM32H5E4, STM32H5E5, STM32H5F4, STM32H5F5 | 4 MB | 256 | 16 sectors per bank, 192 KB |
+
+The maximum of the high-cycle data sectors of a bank is the width of the `EDATA_STRT` field of the option bytes
+(3 bits, resp. 4 bits on the H5E / H5F lines). The ST HAL uses 8 sectors for H5E4 / H5E5 / H5F4 as well - that is
+inconsistent with the CMSIS header of the same package and is not followed (AB#1060, AB#1034).
 
 ---
 
-## Same interface in every family (design basis)
+## Areas of the device
 
-The interface was designed against the flash of all families of the platform, so every family fills the same area list
-with its own values.
+The list is built from the flash size register, the configuration of the high-cycle data flash (`EDATA1R_CUR`,
+`EDATA2R_CUR`) and the CMSIS constants; it reflects the actual configuration of the device.
 
-| Family | User flash erase unit | User flash program unit | Banks | Data flash | OTP |
-|---|---|---|---|---|---|
-| STM32H5 | 8 KB sector | 16 B (128 bit); 2 B in DATA and OTP | 1 - 2 | **yes** (EDATA, 100 000 cycles); none on H503 | 2 KB |
-| STM32U5 | 8 KB page | 16 B (128 bit) | 2 | no | 512 B |
-| STM32H7 | 128 KB or 8 KB sector (by line) | 16 or 32 B (flash word, by line) | 1 - 2 | no | see family branch |
-| STM32L4, STM32G4 | 2 KB page (L4+: 8 KB) | 8 B (64 bit) (L4+: 16 B) | 1 - 2 | no | see family branch |
-| STM32F4 | 16 / 64 / 128 KB sectors (non-uniform: one area per uniform group) | 1 - 8 B (by supply voltage) | 1 - 2 | no | 528 B |
-| STM32F7 | 32 / 128 / 256 KB sectors (non-uniform) | 1 - 8 B | 1 - 2 | no | up to 1 KB |
+| Order | Area | Address | Size | Erase unit | Program unit | Endurance |
+|---|---|---|---|---|---|---|
+| 0 | `USER` bank 1 | `0x08000000` | bank size - sectors taken by the data flash | 8 KB | 16 B (128 bit) | 10 000 |
+| 1 | `USER` bank 2 | `0x08000000` + bank size | bank size - sectors taken by the data flash | 8 KB | 16 B | 10 000 |
+| 2 | `DATA` bank 1 (if configured) | `0x09000000` + (max - N) x 6 KB | N sectors x 6 KB | 6 KB | 2 B (16 bit) | 100 000 |
+| 3 | `DATA` bank 2 (if configured) | `0x09000000` + window of a bank + (max - N) x 6 KB | N sectors x 6 KB | 6 KB | 2 B | 100 000 |
+| last | `OTP` | `0x08FFF000` | 2 KB | - (write once) | 2 B | - |
 
-What it means for the interface:
-
-- **No DATA area is not an error.** The list simply has no `FLASH_AREA_DATA`, the storage layer uses a user window. The
-  big erase units (H7 / F4 / F7) are visible in `EraseSize` (the storage layer then needs more space for the same
-  number of records), the program unit in `ProgramSize`.
-- `Flash_Set_AreaSize`, `Flash_Get_ConfigState`, `Flash_Set_ConfigApply` (configuration of the data area) and
-  `Flash_Handle_Nmi` (ECC double error that raises NMI) have a meaning only where the hardware has it. In the other
-  families they stay in the interface, return `FLASH_REQUEST_ERROR` (the handler returns) and suppress the unused
-  parameters. The families without ECC return `FLASH_REQUEST_ERROR` from the ECC functions as well.
-- A family with the flash erased and programmed by another mechanism (page buffer, fast program, row program) hides it
-  behind `ProgramSize` and the blocking / polling / interrupt styles.
+- The **high-cycle data flash** takes the *last* 1 .. N sectors of a bank (N = 8, 16 on the H5E / H5F lines) from the user
+  flash, the number is set by the option bytes `EDATAxR` (enable bit + `STRT` = sectors - 1). One 8 KB sector provides
+  6 KB of data: the window of a bank is `FLASH_EDATA_SIZE / 2` and the erase unit is the window divided by the maximum
+  sectors per bank (max). The window of the bank 2 follows the window of the bank 1. The N configured sectors are the
+  **last** N sectors of the window of the bank (ST example `FLASH_EDATA_EraseProgram`: 1 sector = `0x0900A800`, 8 sectors
+  = `0x09000000` on H563); the rest of the window is not valid (a read is a bus error). A sector of the area is erased
+  by the number of the flash sector at the end of the bank (sectors per bank - N + k) and the bank of the window.
+- The DATA area is **configurable** (`FLASH_AREA_ATTR_CONFIGURABLE`): `Flash_Set_AreaSize` + `Flash_Set_ConfigApply`
+  program the option bytes and restart the device, see below. It is disabled in the delivery state of the device.
+- The device always has two banks (the STM32H503 has 2 banks of 64 KB, 8 sectors each).
+- The module works with TrustZone disabled (non-secure alias of the registers `FLASH_NS`).
 
 ---
 
-## Public interface in short
+## Enabling the high-cycle data flash
 
-| Group | Functions |
+```c
+/* no DATA area in the area list yet: take four sectors (4 x 6 KB of data) */
+(void)Flash_Set_AreaSize( FLASH_PERIPH_1, FLASH_AREA_DATA, 4u * 6u * 1024u );
+(void)Flash_Set_ConfigApply( FLASH_PERIPH_1 );      /* option byte launch = system reset */
+```
+
+After the reset the area is in the list and, because the default configuration contains a window for every DATA area,
+it is writable without any other step. The sectors are taken from the end of the bank, so
+
+- they must be **blank** - the module refuses the request otherwise,
+- the region `FLASH` of the application must not use them: set the CMake variable `HIGH_CYCLE_SECTORS` of the Linker
+  module to the same number, see below. The module prefers the **bank 2** (the end of the flash) - the code of the
+  application is in the bank 1 and the linker script supports the reserved sectors at the end of the flash only.
+
+---
+
+## Behaviour of the high-cycle data flash
+
+- **Program before read.** An erased location that was not programmed can not be read: the ECC error raises NMI
+  (reference manual, ST community: Init - Erase - Program - Read). Therefore the area has the attribute
+  `FLASH_AREA_ATTR_PROGRAM_BEFORE_READ`: `Flash_Get_BlankState` of the area returns an error, the destination of a
+  write is not checked (the controller reports an error) and the storage layer has to program (write) a word before it
+  reads it - for example a record store reads only the records it has written.
+- **Write.** Half words (16 bit) are programmed one by one, `ProgramSize` is 2 B.
+- **Not cacheable.** All AHB memory is cacheable, the window of the high-cycle data flash has to be non-cacheable
+  (ST example: an MPU region over the window with the attributes 0 = device memory). There is no MPU MCAL module, the
+  application configures the MPU.
+- **Reset of the configuration.** `Flash_Set_AreaSize` programs the option bytes `EDATA1R` / `EDATA2R`, the new size is
+  valid after the reset: `Flash_Get_ConfigState` is `FLASH_CONFIG_PENDING` until then, `Flash_Set_ConfigApply` resets the
+  device through the NVIC module. The size is distributed over the banks, the bank 2 first (the end of the flash).
+
+---
+
+## Linker integration
+
+The Linker module (`Bsp/Linker`, branch `Dev/STM32H5` / the release that contains AB#1057) provides:
+
+| Item | Meaning |
 |---|---|
-| Module management | `Flash_Get_ModuleVersion`, `Flash_Init`, `Flash_Deinit`, `Flash_Task`, `Flash_Get_DefaultConfig`, `Flash_Get_PeriphState` |
-| Memory description | `Flash_Get_AreaCount`, `Flash_Get_AreaInfo` |
-| Data access | `Flash_Get_Data`, `Flash_Get_BlankState`, `Flash_Set_EraseStart`, `Flash_Set_WriteStart` |
-| Operation state | `Flash_Get_OperationState`, `Flash_Get_OperationError` |
-| ECC | `Flash_Get_EccState`, `Flash_Set_EccStateClear`, `Flash_Handle_Nmi` |
-| Data area configuration | `Flash_Set_AreaSize`, `Flash_Get_ConfigState`, `Flash_Set_ConfigApply` |
+| Region `USER_DATA`, CMake variable `USER_DATA_SIZE` | Part of the user flash at the end of `FLASH` reserved for runtime data, a multiple of the 8 KB sector |
+| Region `HIGH_CYCLE` | The high-cycle data window of both banks (96 KB, 192 KB on H5E / H5F, 0 on H503) |
+| CMake variable `HIGH_CYCLE_SECTORS` | Number of sectors at the end of the flash taken by the high-cycle data flash (`FLASH` and `USER_DATA` end before them) |
+| Symbols `_user_data_start / _length / _end`, `_high_cycle_start / _length / _end`, `_high_cycle_sectors` | Bounds of the regions and the reserved sector count |
 
-```c
-flash_ModuleVersion_t Flash_Get_ModuleVersion  ( void );
-
-flash_RequestState_t  Flash_Init               ( const flash_Config_t * const flashConfig );
-flash_RequestState_t  Flash_Deinit             ( flash_PeriphId_t periphId );
-void                  Flash_Task               ( void );
-flash_RequestState_t  Flash_Get_DefaultConfig  ( flash_Config_t * const flashConfig );
-flash_RequestState_t  Flash_Get_PeriphState    ( flash_PeriphId_t periphId, flash_FlagState_t * const periphState );
-
-flash_RequestState_t  Flash_Get_AreaCount      ( flash_PeriphId_t periphId, flash_AreaId_t * const areaCount );
-flash_RequestState_t  Flash_Get_AreaInfo       ( flash_PeriphId_t periphId, flash_AreaId_t areaId,
-                                                 flash_AreaInfo_t * const areaInfo );
-
-flash_RequestState_t  Flash_Get_Data           ( flash_PeriphId_t periphId, flash_Address_t address,
-                                                 flash_DataByte_t * const data, flash_Size_t size );
-flash_RequestState_t  Flash_Get_BlankState     ( flash_PeriphId_t periphId, flash_Address_t address,
-                                                 flash_Size_t size, flash_FlagState_t * const blankState );
-flash_RequestState_t  Flash_Set_EraseStart     ( flash_PeriphId_t periphId, flash_Address_t address, flash_Size_t size );
-flash_RequestState_t  Flash_Set_WriteStart     ( flash_PeriphId_t periphId, flash_Address_t address,
-                                                 const flash_DataByte_t * const data, flash_Size_t size );
-
-flash_RequestState_t  Flash_Get_OperationState ( flash_PeriphId_t periphId, flash_OperationState_t * const operationState );
-flash_RequestState_t  Flash_Get_OperationError ( flash_PeriphId_t periphId, flash_Error_t * const operationError );
-
-flash_RequestState_t  Flash_Get_EccState       ( flash_PeriphId_t periphId, flash_EccState_t * const eccState );
-flash_RequestState_t  Flash_Set_EccStateClear  ( flash_PeriphId_t periphId );
-void                  Flash_Handle_Nmi         ( void );
-
-flash_RequestState_t  Flash_Set_AreaSize       ( flash_PeriphId_t periphId, flash_AreaType_t areaType, flash_Size_t size );
-flash_RequestState_t  Flash_Get_ConfigState    ( flash_PeriphId_t periphId, flash_ConfigState_t * const configState );
-flash_RequestState_t  Flash_Set_ConfigApply    ( flash_PeriphId_t periphId );
-```
-
-Every function returns `FLASH_REQUEST_OK` / `FLASH_REQUEST_ERROR` and checks its parameters and the hardware state
-before it touches a register. `FLASH_REQUEST_OK` of a start function means "finished" in blocking style and "started"
-in polling and interrupt style.
-
-`Flash_Set_AreaSize` / `Flash_Set_ConfigApply` change the size of a **configurable** area (attribute
-`FLASH_AREA_ATTR_CONFIGURABLE`, today the high-cycle data flash of STM32H5): the request is stored, it becomes valid
-after `Flash_Set_ConfigApply` (reset of the device) and `Flash_Get_ConfigState` reports `FLASH_CONFIG_PENDING` until
-then. The module refuses sectors that are not blank. See the README of the family.
-
-### Public types
-
-| Type | Meaning |
-|---|---|
-| `flash_RequestState_t`, `flash_FlagState_t`, `flash_ModuleVersion_t` | Common module types |
-| `flash_PeriphId_t` | Controller (`FLASH_PERIPH_1`; the interface is the same as of the multi-instance modules) |
-| `flash_Address_t`, `flash_Size_t`, `flash_DataByte_t`, `flash_AreaId_t` | Address, size in bytes, data byte, index in the area list |
-| `flash_AreaType_t`, `flash_AreaAttr_t`, `flash_AreaInfo_t` | Area description |
-| `flash_Window_t` | Access window: `Address`, `Size` |
-| `flash_OperationStyle_t` | `FLASH_STYLE_BLOCKING`, `FLASH_STYLE_POLLING`, `FLASH_STYLE_INTERRUPT` |
-| `flash_OperationType_t`, `flash_OperationState_t` | `FLASH_OPERATION_NONE / ERASE / WRITE`, `FLASH_STATE_IDLE / BUSY / FAILED` |
-| `flash_Error_t` | Error bit mask: `FLASH_ERR_PROTECTION`, `FLASH_ERR_SEQUENCE`, `FLASH_ERR_NOT_ERASED`, `FLASH_ERR_OPERATION`, `FLASH_ERR_TIMEOUT`, `FLASH_ERR_ECC_CORRECTED`, `FLASH_ERR_ECC_DETECTED` |
-| `flash_EccState_t` | ECC error mask and the address of the failing word |
-| `flash_ConfigState_t` | `FLASH_CONFIG_APPLIED`, `FLASH_CONFIG_PENDING` (data area change waits for the reset) |
-| `flash_OperationCallback_t`, `flash_ErrorCallback_t` | End of operation (operation, address, size, error mask), error (error mask, address) |
-| `flash_Config_t` | `PeriphId`, `OperationStyle`, `IrqPrio`, `WindowCount`, `Windows[FLASH_WINDOW_MAX]`, `OperationCallback`, `ErrorCallback` |
+The access window of the application is then `_user_data_start` .. `_user_data_end` (see the usage in the README of the
+master branch); the DATA area needs no window to be declared.
 
 ---
 
-## Usage
+## ECC
 
-The examples are the same for every family.
+The flash has a 9-bit ECC of every 128-bit word (the high-cycle data flash: of every 16-bit half word). A corrected
+single error is flagged (`ECCC`), an uncorrectable double error (`ECCD`) raises **NMI**.
 
-### Initialization with the data windows
+- **Read.** `Flash_Get_Data` (and the blank check) masks the NMI of the double error (`SBS_ECCNMIR`) for the time of the
+  read and reports the error as `FLASH_REQUEST_ERROR` (the buffer is not valid) instead of the NMI; a corrected error
+  does not fail the read. A word whose programming was interrupted by a power loss is expected to report `ECCD` when
+  it is read - the storage layer above the module treats such a record as invalid. A range with an uncorrectable error
+  is never reported as blank (the write is refused), which protects the OTP area.
+- **State.** The errors are latched with the decoded address (`Flash_Get_EccState`, the address decode follows the ST
+  HAL: user flash, OTP and data flash; 0 for the system flash and the option byte keys) until
+  `Flash_Set_EccStateClear`.
+- **NMI.** `Flash_Handle_Nmi()` is the hook for the `NMI_Handler` of the application: it clears the flag (the NMI would
+  come again), latches the error and calls the error callback.
+- **Interrupt style.** The interrupt of the corrected error (`ECCIE`) is enabled and reported by the error callback
+  from the flash interrupt; in the polling style `Flash_Task()` does it.
 
-```c
-extern uint8_t _user_data_start;            /* linker region USER_DATA (bounds exported by the Linker module) */
-extern uint8_t _user_data_end;
+## OTP
 
-flash_Config_t flashConfig;
-flash_Size_t   userDataSize;
-
-(void)Flash_Get_DefaultConfig( &flashConfig );  /* blocking, one window per existing DATA area */
-
-userDataSize = (flash_Size_t)( &_user_data_end - &_user_data_start );
-
-if ( 0u < userDataSize )                        /* data in the user flash (all families)       */
-{
-    flashConfig.Windows[ flashConfig.WindowCount ].Address = (flash_Address_t)&_user_data_start;
-    flashConfig.Windows[ flashConfig.WindowCount ].Size    = userDataSize;
-    flashConfig.WindowCount++;
-}
-
-(void)Flash_Init( &flashConfig );
-```
-
-### Choosing the area for the data (storage layer)
-
-```c
-flash_AreaId_t    areaCount = 0u;
-flash_AreaId_t    areaId    = 0u;
-flash_AreaInfo_t  area;
-flash_AreaInfo_t  dataArea;
-flash_FlagState_t found     = FLASH_FLAG_INACTIVE;
-
-(void)Flash_Get_AreaCount( FLASH_PERIPH_1, &areaCount );
-
-for ( areaId = 0u; areaId < areaCount; areaId++ )
-{
-    (void)Flash_Get_AreaInfo( FLASH_PERIPH_1, areaId, &area );
-
-    if ( ( FLASH_FLAG_INACTIVE == found ) && ( FLASH_AREA_DATA == area.Type ) )
-    {
-        dataArea = area;                        /* high-cycle data flash, if the family has it */
-        found    = FLASH_FLAG_ACTIVE;
-    }
-}
-/* if nothing was found, the window in the user flash is used: its area is looked up by the window address */
-```
-
-The storage layer reads `ProgramSize`, `EraseSize` and `Endurance` of the chosen area and builds its records on them -
-the record size is rounded up to `ProgramSize`, the number of records in an erase unit follows from `EraseSize`.
-
-### Erase, write, read
-
-```c
-flash_RequestState_t result;
-
-result = Flash_Set_EraseStart( FLASH_PERIPH_1, dataArea.Address, dataArea.EraseSize );   /* one erase unit   */
-
-if ( FLASH_REQUEST_OK == result )
-{
-    result = Flash_Set_WriteStart( FLASH_PERIPH_1, dataArea.Address, record, recordSize ); /* recordSize is a multiple of ProgramSize */
-}
-
-if ( FLASH_REQUEST_OK == result )
-{
-    result = Flash_Get_Data( FLASH_PERIPH_1, dataArea.Address, readBack, recordSize );    /* ECC checked read */
-}
-```
-
-The memory of the DATA and USER areas is memory mapped, so it can be read directly through a pointer as well;
-`Flash_Get_Data` adds the address validation and the ECC check.
-
-### Interrupt style
-
-```c
-static void Storage_OperationCallback( flash_PeriphId_t periphId, flash_OperationType_t operation,
-                                       flash_Address_t address, flash_Size_t size, flash_Error_t error )
-{
-    /* called from the FLASH interrupt: next step of the storage state machine */
-}
-
-flashConfig.OperationStyle    = FLASH_STYLE_INTERRUPT;
-flashConfig.OperationCallback = Storage_OperationCallback;
-```
+The OTP area is written by 16 bits and only once: it is never erased, a destination that is not blank is refused
+(`FLASH_ERR_NOT_ERASED`) and the area has to be given as an **access window** of the configuration (it is not in the
+default configuration, so the OTP can not be written by accident). The lock of the OTP blocks (`OTPBLR`) is not
+touched. The write is irreversible - it is tested by the unit tests only.
 
 ---
 
-## Behaviour and limits
+## Implementation status
 
-- **Erase before write.** Flash can be written once after an erase. A write over a non-blank location is refused.
-- **Interrupted write.** A word whose write was interrupted by a power loss may have an invalid ECC (families with ECC)
-  and report the uncorrectable error when it is read. Where the double error raises **NMI** (e.g. STM32H5),
-  `Flash_Handle_Nmi()` is the hook for the NMI handler and `Flash_Get_EccState` returns the failing address, so the
-  storage layer can treat the record as invalid. A corrected single error is reported by `FLASH_ERR_ECC_CORRECTED` and
-  the `ErrorCallback`. Records of the storage layer should carry a checksum and the layer should handle the power loss
-  between the erase and the write.
-- **Bus stall.** An erase or write of a bank can stall the code fetched from the same bank until the operation is
-  finished (a sector erase takes milliseconds). Data in the other bank than the interrupt handlers and the hot code
-  avoids it - the `Bank` field of the area tells which one it is.
-- **Caches.** An erase or write must not leave stale content in the flash caches of the family (data cache, ART
-  accelerator, instruction cache); how it is guaranteed is documented in the family branch.
-- **Clocks and latency** of the flash are owned by the RCC module; the module only requests the flash interface clock
-  from it. The FLASH interrupt is configured through the NVIC module.
-- **Not part of the first version:** option bytes other than the configuration of the data area (write protection, boot
-  address, ...), bank swap, TrustZone secure operations (the module works with TrustZone disabled), external flash
-  memories.
-- **OTP** is irreversible: the write is tested by unit tests only.
+| Function | Status | Task |
+|---|---|---|
+| `Flash_Get_ModuleVersion`, `Flash_Get_DefaultConfig` | done | AB#1034 |
+| `Flash_Get_AreaCount`, `Flash_Get_AreaInfo` | done | AB#1034 |
+| `Flash_Init`, `Flash_Deinit`, `Flash_Get_PeriphState`, `Flash_Get_Data`, `Flash_Get_BlankState`, `Flash_Set_EraseStart`, `Flash_Set_WriteStart` (user flash) | done | AB#1035 |
+| Access windows (`Flash_Init` check, erase / write check) | done | AB#1039 |
+| `Flash_Set_AreaSize`, `Flash_Get_ConfigState`, `Flash_Set_ConfigApply`, DATA area erase / write | done | AB#1036 |
+| OTP write | done | AB#1037 |
+| `Flash_Get_OperationState`, `Flash_Get_OperationError` | done | AB#1035 |
+| `Flash_Task`, `Flash_Get_EccState`, `Flash_Set_EccStateClear`, `Flash_Handle_Nmi`, polling / interrupt style, callbacks, ECC protected read | done | AB#1038 |
+| Unit tests | 98 tests (all STM32H5 lines): memory map, default configuration, initialization, access windows, read, blank check, erase, write, data flash, configuration of the data flash, ECC, polling and interrupt style, OTP | AB#1040 |
+| Integration tests | written for the memory map and the user flash, not run on hardware; data flash, ECC and OTP read tests to be added with the boards | AB#1041 |
 
 ---
 
-## Repository layout and branches
+## Open points (resolved during the implementation, written to the tickets)
 
-The master holds this README and the license. The family branches (`Dev/<Family>`, `Releases/<Family>`) hold:
+1. Behaviour of the high-cycle data flash on hardware (the layout follows the ST example): erase by the sector numbers
+   at the end of the bank, programming of half words, the load of the option bytes (programming of the option bytes
+   and the reset), the NMI on a read of an erased location.
+2. Readability of the flash size register and of the option byte registers before `Flash_Init` (the area list is built
+   without the initialization of the module).
+3. Ownership of `NMI_Handler` (Startup / Core) and the call of `Flash_Handle_Nmi`.
+4. Whether the instruction cache can return stale content for a flash area that was just erased or written; if so, the
+   module has to invalidate it (there is no MCAL module of the cache yet).
+5. The ST LL has no functions for the flash erase and program - the module uses the registers of the CMSIS header
+   (private functions of the module); to be moved to the RAL port when the Ral gets a flash LL.
+6. The SBS register `SBS_ECCNMIR` (mask of the ECC NMI) is accessed directly (no MCAL module of the SBS); whether the
+   mask works as described for the read of an erased location of the data flash is verified on hardware.
+7. The non-cacheable MPU region over the window of the data flash (no MCAL module of the MPU).
+
+---
+
+## Repository layout (branch `Dev/STM32H5`)
 
 | Path | Content |
 |---|---|
-| `README.md` | README of the family: lines, areas of every line, specifics, status |
 | `Flash_Port.h`, `Flash_Types.h` | Public interface (identical in all families) |
-| `Flash*.c`, `Flash.h` | Implementation of the family |
+| `Flash.c`, `Flash_Map.c`, `Flash.h` | Implementation (module functions, memory map) |
 | `CMakeLists.txt` | Library `Flash_Lib` of the EmBi platform |
-| `Tests/UnitTests` | Unit tests (Unity + CMock + RegMem) |
+| `Tests/UnitTests` | Unit tests (Unity + RegMem); the flash memory is emulated at the MCU addresses by `Ut_FlashMem.c` |
 | `Tests/IntegrationTests` | Integration tests on the target (probe-rs) |
-
-A change of the public interface is made in all families.
 
 ---
 
