@@ -60,6 +60,10 @@ flash_RequestState_t    Flash_Get_EccState          ( flash_PeriphId_t periphId,
 flash_RequestState_t    Flash_Set_EccStateClear     ( flash_PeriphId_t periphId );
 void                    Flash_Handle_Nmi            ( void );
 
+/*--------------------------------- TrustZone ---------------------------------*/
+
+flash_RequestState_t    Flash_Get_TrustZoneState    ( flash_TrustZoneState_t * const state );
+
 /*------------------------- Data area configuration --------------------------*/
 
 flash_RequestState_t    Flash_Set_AreaSize          ( flash_PeriphId_t periphId, flash_AreaType_t areaType, flash_Size_t size );

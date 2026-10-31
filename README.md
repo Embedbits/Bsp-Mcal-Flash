@@ -95,6 +95,11 @@ it is writable without any other step. The sectors are taken from the end of the
 - **Reset of the configuration.** `Flash_Set_AreaSize` programs the option bytes `EDATA1R` / `EDATA2R`, the new size is
   valid after the reset: `Flash_Get_ConfigState` is `FLASH_CONFIG_PENDING` until then, `Flash_Set_ConfigApply` resets the
   device through the NVIC module. The size is distributed over the banks, the bank 2 first (the end of the flash).
+  The controller loads the programmed option bytes to `EDATA1R_CUR` / `EDATA2R_CUR` at the end of the option byte change
+  already (RM0481 Rev 5, 7.4.3), so the module keeps the configuration valid until the reset itself (saved at the first
+  `Flash_Set_AreaSize` since `Flash_Init`); a request of the valid size ends the pending state, `Flash_Init` starts
+  with the configuration of the option registers (a configuration programmed before a `Flash_Deinit` / `Flash_Init`
+  without the reset is reported as applied).
 
 ---
 
@@ -125,8 +130,9 @@ single error is flagged (`ECCC`), an uncorrectable double error (`ECCD`) raises 
   it is read - the storage layer above the module treats such a record as invalid. A range with an uncorrectable error
   is never reported as blank (the write is refused), which protects the OTP area.
 - **State.** The errors are latched with the decoded address (`Flash_Get_EccState`, the address decode follows the ST
-  HAL: user flash, OTP and data flash; 0 for the system flash and the option byte keys) until
-  `Flash_Set_EccStateClear`.
+  HAL: user flash, OTP and data flash; 0 for the system flash, the option byte keys and the read-only area) until
+  `Flash_Set_EccStateClear`. The ECC reports the OTP words of 4 bytes from `0x0200` on STM32H503 (measured, RM0492 and
+  the ST HAL state `0x0600`) and from `0x0600` on the other lines (RM0481, RM0517, not measured yet) - Bug AB#1191.
 - **NMI.** `Flash_Handle_Nmi()` is the hook for the `NMI_Handler` of the application: it clears the flag (the NMI would
   come again), latches the error and calls the error callback.
 - **Interrupt style.** The interrupt of the corrected error (`ECCIE`) is enabled and reported by the error callback
@@ -138,6 +144,15 @@ The OTP area is written by 16 bits and only once: it is never erased, a destinat
 (`FLASH_ERR_NOT_ERASED`) and the area has to be given as an **access window** of the configuration (it is not in the
 default configuration, so the OTP can not be written by accident). The lock of the OTP blocks (`OTPBLR`) is not
 touched. The write is irreversible - it is tested by the unit tests only.
+
+---
+
+## TrustZone
+
+`Flash_Get_TrustZoneState` is a read-only getter (no option byte is read or written by anything else, no side
+effect) that reports whether TrustZone is enabled (`TZEN` of `OPTSR2_CUR`, RM0481 Rev 5 Section 7.11.23) and the
+secure watermark of each bank (`SECWM1R_CUR` / `SECWM2R_CUR`). STM32H503 has no TrustZone: the function exists with
+the same signature but always reports it inactive without accessing any option byte.
 
 ---
 
@@ -153,8 +168,11 @@ touched. The write is irreversible - it is tested by the unit tests only.
 | OTP write | done | AB#1037 |
 | `Flash_Get_OperationState`, `Flash_Get_OperationError` | done | AB#1035 |
 | `Flash_Task`, `Flash_Get_EccState`, `Flash_Set_EccStateClear`, `Flash_Handle_Nmi`, polling / interrupt style, callbacks, ECC protected read | done | AB#1038 |
+| `Flash_Get_TrustZoneState` | done | AB#1849 |
 | Unit tests | 98 tests (all STM32H5 lines): memory map, default configuration, initialization, access windows, read, blank check, erase, write, data flash, configuration of the data flash, ECC, polling and interrupt style, OTP | AB#1040 |
+| Unit tests of `Flash_Get_TrustZoneState` | 4 tests (all 12 STM32H5 lines) | AB#1850 |
 | Integration tests | written for the memory map and the user flash, not run on hardware; data flash, ECC and OTP read tests to be added with the boards | AB#1041 |
+| Integration test of `Flash_Get_TrustZoneState` | compiled, not run on hardware | AB#1850 |
 
 ---
 

@@ -61,8 +61,9 @@ void                    Flash_Hw_Restore_EccNmi     ( uint32_t previousMask );
 flash_RequestState_t    Flash_Hw_Unlock_Options     ( void );
 void                    Flash_Hw_Lock_Options       ( void );
 flash_RequestState_t    Flash_Hw_Set_DataSectors    ( flash_BankId_t bankId, flash_Size_t sectorCnt );
-flash_Size_t            Flash_Hw_Get_DataSectors    ( flash_BankId_t bankId );
 void                    Flash_Hw_Start_OptionProgram( void );
+
+void                    Flash_Hw_Get_TrustZoneState ( flash_TrustZoneState_t * const state );
 
 #ifdef __cplusplus
 }

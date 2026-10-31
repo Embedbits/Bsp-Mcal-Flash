@@ -47,6 +47,8 @@ typedef struct
     flash_Error_t          OperationError; /**< Error mask of the last operation         */
     flash_EccState_t       Ecc;            /**< ECC errors latched from the controller   */
     flash_Operation_t      Operation;      /**< Operation in progress                    */
+    flash_ConfigState_t    ConfigState;    /**< State of the configuration of the high-cycle data flash */
+    flash_Size_t           ValidSectors[ FLASH_BANK_CNT ]; /**< Data sectors of every bank valid until the reset */
 }   flash_Context_t;
 
 /* ========================== SYMBOLIC CONSTANTS ============================ */
@@ -77,7 +79,8 @@ static flash_Context_t flash_Context =
     .Initialized    = FLASH_FLAG_INACTIVE,
     .OperationState = FLASH_STATE_IDLE,
     .OperationError = FLASH_ERR_NONE,
-    .Ecc            = { FLASH_ERR_NONE, 0u }
+    .Ecc            = { FLASH_ERR_NONE, 0u },
+    .ConfigState    = FLASH_CONFIG_APPLIED
 };
 
 /* ======================= FORWARD DECLARATIONS ============================= */
@@ -95,7 +98,8 @@ static flash_DataByte_t     Flash_Read_Byte         ( flash_AreaType_t areaType,
 static flash_RequestState_t Flash_Get_DataDistribution ( flash_Size_t size, flash_Size_t * const sectorCnt );
 static flash_Error_t        Flash_Run_DataConfig    ( const flash_Size_t * const sectorCnt );
 static flash_Error_t        Flash_Program_DataConfig( const flash_Size_t * const sectorCnt );
-static flash_ConfigState_t  Flash_Get_ConfigPending ( void );
+static void                 Flash_Save_ValidSectors ( void );
+static flash_ConfigState_t  Flash_Get_ConfigPending ( const flash_Size_t * const sectorCnt );
 static flash_Error_t        Flash_Write_Unit        ( const flash_AreaInfo_t * const areaInfo, flash_Address_t address, const flash_DataByte_t * const data );
 static flash_Error_t        Flash_Write_QuadWord    ( flash_Address_t address, const flash_DataByte_t * const data );
 static flash_Error_t        Flash_Write_HalfWord    ( flash_Address_t address, const flash_DataByte_t * const data );
@@ -196,6 +200,7 @@ flash_RequestState_t Flash_Init( const flash_Config_t * const flashConfig )
         flash_Context.OperationError = FLASH_ERR_NONE;
         flash_Context.Ecc.Error      = FLASH_ERR_NONE;
         flash_Context.Ecc.Address    = 0u;
+        flash_Context.ConfigState    = FLASH_CONFIG_APPLIED;
         flash_Context.Initialized    = FLASH_FLAG_ACTIVE;
 
         if ( FLASH_STYLE_INTERRUPT == flashConfig->OperationStyle )
@@ -786,6 +791,37 @@ flash_RequestState_t Flash_Set_EccStateClear( flash_PeriphId_t periphId )
 
 
 /**
+ * \brief Reads the state of TrustZone (TZEN) and the secure watermark of each bank from the option bytes.
+ *
+ * \param state [out]: State of TrustZone
+ *
+ * \return State of request execution. Returns \ref FLASH_REQUEST_OK if request was
+ *         success, otherwise returns \ref FLASH_REQUEST_ERROR.
+ *
+ * \note Read-only, no side effect. A device without TrustZone always reports \ref FLASH_FUNCTION_INACTIVE
+ *       and an empty secure watermark (the option bytes are not accessed on such a device).
+ */
+flash_RequestState_t Flash_Get_TrustZoneState( flash_TrustZoneState_t * const state )
+{
+    flash_RequestState_t retState = FLASH_REQUEST_ERROR;
+
+    retState = Flash_Check_Initialized( FLASH_PERIPH_1 );
+
+    if (    ( FLASH_REQUEST_OK == retState )
+         && ( FLASH_NULL_PTR != state )    )
+    {
+        Flash_Hw_Get_TrustZoneState( state );
+    }
+    else
+    {
+        retState = FLASH_REQUEST_ERROR;
+    }
+
+    return (retState);
+}
+
+
+/**
  * \brief Hook of the NMI handler: handles the uncorrectable ECC error raised as NMI.
  *
  * Clears the flag of the error (otherwise the NMI would come again), latches the error and its address
@@ -832,6 +868,11 @@ void Flash_Handle_Nmi( void )
  * sectors given back to the user flash are lost. The option bytes are programmed, the new size is
  * valid after the reset (\ref Flash_Set_ConfigApply, \ref Flash_Get_ConfigState).
  *
+ * The controller loads the programmed option bytes to the current option registers (EDATA1R_CUR /
+ * EDATA2R_CUR) at the end of the option byte change already (RM0481 Rev 5, 7.4.3), so the module keeps
+ * the configuration valid until the reset itself: the configuration is pending while the requested
+ * sectors differ from the ones valid at the first request since \ref Flash_Init.
+ *
  * \note Only the high-cycle data flash can be configured, only on the lines that have it.
  */
 flash_RequestState_t Flash_Set_AreaSize( flash_PeriphId_t periphId, flash_AreaType_t areaType, flash_Size_t size )
@@ -858,6 +899,8 @@ flash_RequestState_t Flash_Set_AreaSize( flash_PeriphId_t periphId, flash_AreaTy
         flash_Context.OperationState = FLASH_STATE_BUSY;
         flash_Context.OperationError = FLASH_ERR_NONE;
 
+        Flash_Save_ValidSectors();
+
         error = Flash_Run_DataConfig( sectorCnt );
 
         Flash_Set_Result( error );
@@ -865,6 +908,10 @@ flash_RequestState_t Flash_Set_AreaSize( flash_PeriphId_t periphId, flash_AreaTy
         if ( FLASH_ERR_NONE != error )
         {
             retState = FLASH_REQUEST_ERROR;
+        }
+        else
+        {
+            flash_Context.ConfigState = Flash_Get_ConfigPending( sectorCnt );
         }
     }
 
@@ -881,8 +928,9 @@ flash_RequestState_t Flash_Set_AreaSize( flash_PeriphId_t periphId, flash_AreaTy
  * \return State of request execution. Returns \ref FLASH_REQUEST_OK if request was
  *         success, otherwise returns \ref FLASH_REQUEST_ERROR.
  *
- * \note The state is \ref FLASH_CONFIG_PENDING if the option bytes to be programmed differ from the
- *       valid ones. Returns an error on the lines without a configurable area.
+ * \note The state is \ref FLASH_CONFIG_PENDING after \ref Flash_Set_AreaSize programmed a configuration
+ *       that differs from the valid one, until the reset (or the next \ref Flash_Init). Returns an error
+ *       on the lines without a configurable area.
  */
 flash_RequestState_t Flash_Get_ConfigState( flash_PeriphId_t periphId, flash_ConfigState_t * const configState )
 {
@@ -895,7 +943,7 @@ flash_RequestState_t Flash_Get_ConfigState( flash_PeriphId_t periphId, flash_Con
          && ( FLASH_NULL_PTR != configState )
          && ( 0u < maxCnt ) )
     {
-        *configState = Flash_Get_ConfigPending();
+        *configState = flash_Context.ConfigState;
     }
     else
     {
@@ -921,7 +969,7 @@ flash_RequestState_t Flash_Set_ConfigApply( flash_PeriphId_t periphId )
 {
     flash_RequestState_t retState    = FLASH_REQUEST_ERROR;
     flash_Size_t         maxCnt      = Flash_Get_DataSectorsMax();
-    flash_ConfigState_t  configState = Flash_Get_ConfigPending();
+    flash_ConfigState_t  configState = flash_Context.ConfigState;
 
     retState = Flash_Check_Initialized( periphId );
 
@@ -1084,25 +1132,51 @@ static flash_Error_t Flash_Program_DataConfig( const flash_Size_t * const sector
 
 
 /**
- * \brief Compares the option bytes of the high-cycle data flash to be programmed with the valid ones.
+ * \brief Saves the data sectors of every bank valid until the reset (the current option registers), when no
+ *        configuration is pending.
+ *
+ * While a configuration is pending the current option registers hold the programmed configuration already
+ * (they are loaded at the end of the option byte change), the saved values stay.
+ */
+static void Flash_Save_ValidSectors( void )
+{
+    flash_BankId_t bankId;
+
+    if ( FLASH_CONFIG_APPLIED == flash_Context.ConfigState )
+    {
+        for ( bankId = 0u; bankId < FLASH_BANK_CNT; bankId++ )
+        {
+            flash_Context.ValidSectors[ bankId ] = Flash_Get_DataSectors( bankId );
+        }
+    }
+    else
+    {
+        /* Pending configuration: the valid sectors are saved already */
+    }
+}
+
+
+/**
+ * \brief Compares the programmed configuration of the high-cycle data flash with the one valid until the reset.
+ *
+ * \param sectorCnt [in]: Programmed count of the sectors of every bank
  *
  * \return \ref FLASH_CONFIG_PENDING if the configuration of a bank differs
  */
-static flash_ConfigState_t Flash_Get_ConfigPending( void )
+static flash_ConfigState_t Flash_Get_ConfigPending( const flash_Size_t * const sectorCnt )
 {
     flash_ConfigState_t configState = FLASH_CONFIG_APPLIED;
     flash_BankId_t      bankId;
-    flash_Size_t        validCnt;
-    flash_Size_t        programmedCnt;
 
     for ( bankId = 0u; bankId < FLASH_BANK_CNT; bankId++ )
     {
-        validCnt      = Flash_Get_DataSectors( bankId );
-        programmedCnt = Flash_Hw_Get_DataSectors( bankId );
-
-        if ( validCnt != programmedCnt )
+        if ( flash_Context.ValidSectors[ bankId ] != sectorCnt[ bankId ] )
         {
             configState = FLASH_CONFIG_PENDING;
+        }
+        else
+        {
+            /* The configuration of the bank is unchanged */
         }
     }
 

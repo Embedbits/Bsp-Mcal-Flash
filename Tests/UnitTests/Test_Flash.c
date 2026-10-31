@@ -48,6 +48,17 @@
 /** Size of the OTP area */
 #define UT_FLASH_OTP_SIZE                   ( 0x800u )
 
+/** Count of the addresses reported by the ECC for the OTP area (one address per word of 4 bytes) */
+#define UT_FLASH_ECC_OTP_WORD_CNT           ( UT_FLASH_OTP_SIZE / 4u )
+
+#if defined(STM32H503xx)
+/** Address reported by the ECC for the first OTP word: measured on STM32H503 (Bug AB#1191), RM0492 Rev 3 states 0x0600 */
+#define UT_FLASH_ECC_OTP_FIRST              ( 0x200u )
+#else
+/** Address reported by the ECC for the first OTP word (RM0481 Rev 5 Table 88, RM0517 Rev 1 Table 75) */
+#define UT_FLASH_ECC_OTP_FIRST              ( 0x600u )
+#endif
+
 /** Base address of the high-cycle data flash */
 #define UT_FLASH_DATA_ADDR                  ( 0x09000000u )
 
@@ -57,12 +68,19 @@
 /** Size of the flash of the device (default of the ST header) */
 #define UT_FLASH_SIZE                       ( (uint32_t)FLASH_SIZE_DEFAULT )
 
+/** Value of the TZEN field (OPTSR2_CUR) when TrustZone is disabled (RM0481 Rev 5 Section 7.11.23) */
+#define UT_FLASH_TZEN_DISABLED              ( 0xC3u )
+
+/** Value of the TZEN field (OPTSR2_CUR) when TrustZone is enabled (RM0481 Rev 5 Section 7.11.23) */
+#define UT_FLASH_TZEN_ENABLED               ( 0xB4u )
+
 /* ======================= FORWARD DECLARATIONS ============================= */
 
 #if defined(FLASH_EDATAR_EDATA_EN)
 static uint32_t Ut_Flash_Get_DataSectorsMax ( void );
 static void     Ut_Flash_Set_DataSectors    ( uint32_t bank1Sectors, uint32_t bank2Sectors );
 static void     Ut_Flash_Init_DataFlash     ( uint32_t bank1Sectors, uint32_t bank2Sectors );
+static void     Ut_Flash_Load_OptionBytes   ( void );
 #endif
 
 static void     Ut_Flash_Init               ( void );
@@ -1116,7 +1134,7 @@ void Ut_Flash_Set_AreaSize_DataFlash_OptionBytesOfBank2ProgrammedFirst( void )
     TEST_ASSERT_BITS_HIGH( FLASH_OPTCR_OPTSTART, FLASH_NS->OPTCR );
     TEST_ASSERT_BITS_HIGH( FLASH_OPTCR_OPTLOCK, FLASH_NS->OPTCR );
     TEST_ASSERT_BITS_HIGH( FLASH_CR_LOCK, FLASH_NS->NSCR );
-    TEST_ASSERT_EQUAL_HEX32( 0u, FLASH_NS->EDATA2R_CUR );               /* valid after the reset */
+    TEST_ASSERT_EQUAL_HEX32( 0u, FLASH_NS->EDATA2R_CUR );               /* loaded by the controller, not written by the module */
     TEST_ASSERT_EQUAL( FLASH_REQUEST_OK, Flash_Get_OperationState( FLASH_PERIPH_1, &state ) );
     TEST_ASSERT_EQUAL( FLASH_STATE_IDLE, state );
 #else
@@ -1275,11 +1293,13 @@ void Ut_Flash_Get_ConfigState_DataFlash_PendingUntilTheReset( void )
     TEST_ASSERT_EQUAL( FLASH_CONFIG_APPLIED, configState );
 
     TEST_ASSERT_EQUAL( FLASH_REQUEST_OK, Flash_Set_AreaSize( FLASH_PERIPH_1, FLASH_AREA_DATA, 2u * UT_FLASH_DATA_ERASE_SIZE ) );
+    Ut_Flash_Load_OptionBytes();
 
     TEST_ASSERT_EQUAL( FLASH_REQUEST_OK, Flash_Get_ConfigState( FLASH_PERIPH_1, &configState ) );
     TEST_ASSERT_EQUAL( FLASH_CONFIG_PENDING, configState );
 
-    FLASH_NS->EDATA2R_CUR = FLASH_NS->EDATA2R_PRG;                          /* the option bytes are loaded by the reset */
+    TEST_ASSERT_EQUAL( FLASH_REQUEST_OK, Flash_Deinit( FLASH_PERIPH_1 ) );     /* the reset: the module starts with the loaded configuration */
+    Ut_Flash_Init_NoWindow();
 
     TEST_ASSERT_EQUAL( FLASH_REQUEST_OK, Flash_Get_ConfigState( FLASH_PERIPH_1, &configState ) );
     TEST_ASSERT_EQUAL( FLASH_CONFIG_APPLIED, configState );
@@ -1300,10 +1320,41 @@ void Ut_Flash_Set_ConfigApply_DataFlash_ResetOnlyWhenPending( void )
     TEST_ASSERT_EQUAL( FLASH_REQUEST_ERROR, Flash_Set_ConfigApply( FLASH_PERIPH_1 ) );             /* nothing pending: no reset */
 
     TEST_ASSERT_EQUAL( FLASH_REQUEST_OK, Flash_Set_AreaSize( FLASH_PERIPH_1, FLASH_AREA_DATA, UT_FLASH_DATA_ERASE_SIZE ) );
+    Ut_Flash_Load_OptionBytes();
 
     Nvic_Set_SystemReset_Expect();
     TEST_ASSERT_EQUAL( FLASH_REQUEST_OK, Flash_Set_ConfigApply( FLASH_PERIPH_1 ) );
     TEST_ASSERT_EQUAL( FLASH_REQUEST_ERROR, Flash_Set_ConfigApply( FLASH_PERIPH_CNT ) );
+#else
+    TEST_IGNORE_MESSAGE( "The device has no high-cycle data flash" );
+#endif
+}
+
+void Ut_Flash_Get_ConfigState_DataFlash_ValidSizeRequestedAgain_Applied( void )
+{
+#if defined(FLASH_EDATAR_EDATA_EN)
+    flash_ConfigState_t configState = FLASH_CONFIG_APPLIED;
+
+    Ut_Flash_Set_DataSectors( 0u, 1u );
+    Ut_Flash_Init_NoWindow();
+    Ut_Flash_Unlock();
+
+    TEST_ASSERT_EQUAL( FLASH_REQUEST_OK, Flash_Set_AreaSize( FLASH_PERIPH_1, FLASH_AREA_DATA, 3u * UT_FLASH_DATA_ERASE_SIZE ) );
+    Ut_Flash_Load_OptionBytes();
+
+    TEST_ASSERT_EQUAL( FLASH_REQUEST_OK, Flash_Get_ConfigState( FLASH_PERIPH_1, &configState ) );
+    TEST_ASSERT_EQUAL( FLASH_CONFIG_PENDING, configState );
+
+    Ut_Flash_Unlock();
+    FLASH_NS->OPTCR = 0u;                       /* the OPTLOCK bit of the emulated register stays set */
+
+    TEST_ASSERT_EQUAL( FLASH_REQUEST_OK, Flash_Set_AreaSize( FLASH_PERIPH_1, FLASH_AREA_DATA, UT_FLASH_DATA_ERASE_SIZE ) );   /* the size valid until the reset */
+    Ut_Flash_Load_OptionBytes();
+
+    TEST_ASSERT_EQUAL_HEX32( FLASH_EDATAR_EDATA_EN | 0u, FLASH_NS->EDATA2R_PRG );
+    TEST_ASSERT_EQUAL( FLASH_REQUEST_OK, Flash_Get_ConfigState( FLASH_PERIPH_1, &configState ) );
+    TEST_ASSERT_EQUAL( FLASH_CONFIG_APPLIED, configState );
+    TEST_ASSERT_EQUAL( FLASH_REQUEST_ERROR, Flash_Set_ConfigApply( FLASH_PERIPH_1 ) );             /* nothing pending: no reset */
 #else
     TEST_IGNORE_MESSAGE( "The device has no high-cycle data flash" );
 #endif
@@ -1804,13 +1855,43 @@ void Ut_Flash_Get_EccState_ErrorLatchedUntilCleared( void )
 
 void Ut_Flash_Get_EccState_OtpError_AddressDecoded( void )
 {
+    /* The words measured on STM32H503 (Bug AB#1191): 0x08FFF000 / 0x08FFF004 / 0x08FFF010 / 0x08FFF7FC report 0x200 / 0x201 / 0x204 / 0x3FF */
+    static const uint32_t wordIdList[] = { 0u, 1u, 4u, UT_FLASH_ECC_OTP_WORD_CNT - 1u };
+    flash_EccState_t eccState;
+    uint32_t         listId;
+
+    Ut_Flash_Init();
+
+    for ( listId = 0u; listId < ( sizeof( wordIdList ) / sizeof( wordIdList[ 0 ] ) ); listId++ )
+    {
+        FLASH_NS->ECCDETR = FLASH_ECCR_ECCD | FLASH_ECCR_OTP_ECC | ( UT_FLASH_ECC_OTP_FIRST + wordIdList[ listId ] );
+
+        TEST_ASSERT_EQUAL( FLASH_REQUEST_OK, Flash_Get_EccState( FLASH_PERIPH_1, &eccState ) );
+        TEST_ASSERT_EQUAL_UINT32( FLASH_ERR_ECC_DETECTED, eccState.Error );
+        TEST_ASSERT_EQUAL_HEX32( UT_FLASH_OTP_ADDR + ( wordIdList[ listId ] * 4u ), eccState.Address );
+    }
+}
+
+void Ut_Flash_Get_EccState_OtpFlagOutsideOtpArea_AddressZero( void )
+{
     flash_EccState_t eccState;
 
     Ut_Flash_Init();
-    FLASH_NS->ECCDETR = FLASH_ECCR_ECCD | FLASH_ECCR_OTP_ECC | ( 0x600u + 0x10u );
+    FLASH_NS->ECCDETR = FLASH_ECCR_ECCD | FLASH_ECCR_OTP_ECC | ( UT_FLASH_ECC_OTP_FIRST - 1u );     /* below the OTP area */
 
     TEST_ASSERT_EQUAL( FLASH_REQUEST_OK, Flash_Get_EccState( FLASH_PERIPH_1, &eccState ) );
-    TEST_ASSERT_EQUAL_HEX32( UT_FLASH_OTP_ADDR + ( 0x10u * 4u ), eccState.Address );
+    TEST_ASSERT_EQUAL_UINT32( FLASH_ERR_ECC_DETECTED, eccState.Error );
+    TEST_ASSERT_EQUAL_HEX32( 0u, eccState.Address );
+
+    FLASH_NS->ECCDETR = FLASH_ECCR_ECCD | FLASH_ECCR_OTP_ECC | UT_FLASH_ECC_OTP_FIRST;              /* first OTP word */
+
+    TEST_ASSERT_EQUAL( FLASH_REQUEST_OK, Flash_Get_EccState( FLASH_PERIPH_1, &eccState ) );
+    TEST_ASSERT_EQUAL_HEX32( UT_FLASH_OTP_ADDR, eccState.Address );
+
+    FLASH_NS->ECCDETR = FLASH_ECCR_ECCD | FLASH_ECCR_OTP_ECC | ( UT_FLASH_ECC_OTP_FIRST + UT_FLASH_ECC_OTP_WORD_CNT );   /* behind the OTP area (read-only area) */
+
+    TEST_ASSERT_EQUAL( FLASH_REQUEST_OK, Flash_Get_EccState( FLASH_PERIPH_1, &eccState ) );
+    TEST_ASSERT_EQUAL_HEX32( 0u, eccState.Address );
 }
 
 void Ut_Flash_Get_EccState_SystemFlashError_AddressZero( void )
@@ -1941,6 +2022,88 @@ void Ut_Flash_Task_NothingToServe_NoEffect( void )
 
     TEST_ASSERT_EQUAL( FLASH_REQUEST_OK, Flash_Get_OperationState( FLASH_PERIPH_1, &state ) );
     TEST_ASSERT_EQUAL( FLASH_STATE_IDLE, state );
+}
+
+
+/* ============================== TRUSTZONE =================================== */
+
+/**
+ * \brief Reading the TrustZone state before Flash_Init is rejected.
+ *
+ * \par Expected results
+ * \ref FLASH_REQUEST_ERROR, the module error value of a getter when it is not initialized.
+ */
+void Ut_Flash_Get_TrustZoneState_NotInitialized_ReturnError( void )
+{
+    flash_TrustZoneState_t state;
+
+    TEST_ASSERT_EQUAL( FLASH_REQUEST_ERROR, Flash_Get_TrustZoneState( &state ) );
+}
+
+/**
+ * \brief A null output pointer is rejected after Flash_Init.
+ *
+ * \par Expected results
+ * \ref FLASH_REQUEST_ERROR, no register is accessed.
+ */
+void Ut_Flash_Get_TrustZoneState_InvalidParameters_ReturnError( void )
+{
+    Ut_Flash_Init();
+
+    TEST_ASSERT_EQUAL( FLASH_REQUEST_ERROR, Flash_Get_TrustZoneState( FLASH_NULL_PTR ) );
+}
+
+/**
+ * \brief Disabled TrustZone: the lines with TZEN read the option bytes, STM32H503 (no TZEN) reports the
+ *        same result without accessing any register.
+ *
+ * \par Expected results
+ * \ref FLASH_FUNCTION_INACTIVE and a secure watermark of zero for both banks.
+ */
+void Ut_Flash_Get_TrustZoneState_Disabled_InactiveAndWatermarkZero( void )
+{
+    flash_TrustZoneState_t state;
+
+    Ut_Flash_Init();
+#if defined(FLASH_OPTSR2_TZEN)
+    FLASH_NS->OPTSR2_CUR  = UT_FLASH_TZEN_DISABLED << FLASH_OPTSR2_TZEN_Pos;
+    FLASH_NS->SECWM1R_CUR = 0u;
+    FLASH_NS->SECWM2R_CUR = 0u;
+#endif /* FLASH_OPTSR2_TZEN */
+
+    TEST_ASSERT_EQUAL( FLASH_REQUEST_OK, Flash_Get_TrustZoneState( &state ) );
+    TEST_ASSERT_EQUAL( FLASH_FUNCTION_INACTIVE, state.TzState );
+    TEST_ASSERT_EQUAL_UINT32( 0u, state.SecureWatermark[ 0 ].StartSector );
+    TEST_ASSERT_EQUAL_UINT32( 0u, state.SecureWatermark[ 0 ].EndSector );
+    TEST_ASSERT_EQUAL_UINT32( 0u, state.SecureWatermark[ 1 ].StartSector );
+    TEST_ASSERT_EQUAL_UINT32( 0u, state.SecureWatermark[ 1 ].EndSector );
+}
+
+/**
+ * \brief Enabled TrustZone with the secure watermark of both banks: ignored on STM32H503 (no TrustZone).
+ *
+ * \par Expected results
+ * \ref FLASH_FUNCTION_ACTIVE and the start / end sector of the secure watermark of each bank decoded.
+ */
+void Ut_Flash_Get_TrustZoneState_Active_SecureWatermarkDecoded( void )
+{
+#if defined(FLASH_OPTSR2_TZEN)
+    flash_TrustZoneState_t state;
+
+    Ut_Flash_Init();
+    FLASH_NS->OPTSR2_CUR  = UT_FLASH_TZEN_ENABLED << FLASH_OPTSR2_TZEN_Pos;
+    FLASH_NS->SECWM1R_CUR = ( 2u << FLASH_SECWMR_SECWM_STRT_Pos ) | ( 5u << FLASH_SECWMR_SECWM_END_Pos );
+    FLASH_NS->SECWM2R_CUR = ( 1u << FLASH_SECWMR_SECWM_STRT_Pos ) | ( 3u << FLASH_SECWMR_SECWM_END_Pos );
+
+    TEST_ASSERT_EQUAL( FLASH_REQUEST_OK, Flash_Get_TrustZoneState( &state ) );
+    TEST_ASSERT_EQUAL( FLASH_FUNCTION_ACTIVE, state.TzState );
+    TEST_ASSERT_EQUAL_UINT32( 2u, state.SecureWatermark[ 0 ].StartSector );
+    TEST_ASSERT_EQUAL_UINT32( 5u, state.SecureWatermark[ 0 ].EndSector );
+    TEST_ASSERT_EQUAL_UINT32( 1u, state.SecureWatermark[ 1 ].StartSector );
+    TEST_ASSERT_EQUAL_UINT32( 3u, state.SecureWatermark[ 1 ].EndSector );
+#else
+    TEST_IGNORE_MESSAGE( "The device has no TrustZone" );
+#endif /* FLASH_OPTSR2_TZEN */
 }
 
 
@@ -2590,6 +2753,13 @@ static void Ut_Flash_Init_DataFlash( uint32_t bank1Sectors, uint32_t bank2Sector
     TEST_ASSERT_EQUAL( FLASH_REQUEST_OK, Flash_Get_DefaultConfig( &config ) );
 
     Ut_Flash_Init_Config( &config );
+}
+
+/** Emulates the end of the option byte change: the controller loads the current option registers (RM0481 Rev 5, 7.4.3) */
+static void Ut_Flash_Load_OptionBytes( void )
+{
+    FLASH_NS->EDATA1R_CUR = FLASH_NS->EDATA1R_PRG;
+    FLASH_NS->EDATA2R_CUR = FLASH_NS->EDATA2R_PRG;
 }
 
 #endif /* FLASH_EDATAR_EDATA_EN */

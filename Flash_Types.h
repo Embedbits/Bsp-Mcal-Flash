@@ -77,6 +77,10 @@ extern "C" {
 /** Error mask: uncorrectable ECC error was detected */
 #define FLASH_ERR_ECC_DETECTED              ( 0x40u )
 
+/** Count of the flash banks (same value as FLASH_BANK_CNT of Flash.h, duplicated here because this
+ *  public header is used without that private header) */
+#define FLASH_TZ_BANK_CNT                   ( 2u )
+
 /* ============================== TYPEDEFS ================================== */
 
 /** \brief Type signaling major version of SW module */
@@ -230,6 +234,22 @@ typedef struct
     flash_Error_t   Error;   /**< ECC error mask (FLASH_ERR_ECC_CORRECTED, FLASH_ERR_ECC_DETECTED) */
     flash_Address_t Address; /**< Address of the word with the last ECC error                       */
 }   flash_EccState_t;
+
+
+/** Secure watermark area of a flash bank (option bytes, meaningful only if TrustZone is active) */
+typedef struct
+{
+    uint32_t StartSector; /**< First sector of the secure area of the bank */
+    uint32_t EndSector;   /**< Last sector of the secure area of the bank  */
+}   flash_SecureWatermark_t;
+
+
+/** State of TrustZone (read-only, from the option bytes) */
+typedef struct
+{
+    flash_FunctionState_t   TzState;                           /**< Active if TrustZone is enabled              */
+    flash_SecureWatermark_t SecureWatermark[ FLASH_TZ_BANK_CNT ]; /**< Secure watermark of each bank, valid if active */
+}   flash_TrustZoneState_t;
 
 
 /**

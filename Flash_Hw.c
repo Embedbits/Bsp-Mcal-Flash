@@ -36,17 +36,32 @@
 /** Second key of the option bytes unlock sequence */
 #define FLASH_HW_OPT_KEY2                   ( 0x4C5D6E7Fu )
 
-/** Offset of the OTP area in the units of the address reported by the ECC (as in the ST HAL) */
+#if defined(STM32H503xx)
+/**
+ * Address reported by the ECC for the first word of the OTP area: 0x0200 measured on STM32H503 (Bug AB#1191, the
+ * words 0x08FFF000 / 0x08FFF004 / 0x08FFF010 / 0x08FFF7FC report 0x200 / 0x201 / 0x204 / 0x3FF); RM0492 Rev 3
+ * Table 42 states 0x0600
+ */
+#define FLASH_HW_ECC_OTP_OFFSET             ( 0x200u )
+#else
+/** Address reported by the ECC for the first word of the OTP area (RM0481 Rev 5 Table 88, RM0517 Rev 1 Table 75, ST HAL) */
 #define FLASH_HW_ECC_OTP_OFFSET             ( 0x600u )
+#endif /* STM32H503xx */
 
 /** Multiplier of the address reported by the ECC for the OTP and the high-cycle data area (as in the ST HAL) */
 #define FLASH_HW_ECC_WORD_FACTOR            ( 4u )
+
+/** Count of the addresses reported by the ECC for the OTP area (one address per word of 4 bytes) */
+#define FLASH_HW_ECC_OTP_WORD_CNT           ( (uint32_t)FLASH_OTP_SIZE / FLASH_HW_ECC_WORD_FACTOR )
 
 /** Interrupt enable bits of the control register (end of the operation and the errors) */
 #define FLASH_HW_INTERRUPT_MASK             ( FLASH_CR_EOPIE | FLASH_CR_WRPERRIE | FLASH_CR_PGSERRIE | FLASH_CR_STRBERRIE | FLASH_CR_INCERRIE )
 
 /** Sector erase selection fields of the control register */
 #define FLASH_HW_SECTOR_MASK                ( FLASH_CR_SNB | FLASH_CR_BKSEL )
+
+/** Value of the TZEN field (OPTSR2_CUR) when TrustZone is enabled (RM0481 Rev 5 Section 7.11.23) */
+#define FLASH_HW_TZEN_ACTIVE_VALUE          ( 0xB4u )
 
 /* ======================= FORWARD DECLARATIONS ============================= */
 
@@ -345,7 +360,7 @@ void Flash_Hw_Stop_Program( void )
  *
  * The flags are not cleared. If both a corrected and a detected error are flagged, the address is the
  * address of the detected one. The address of a word outside of the areas of the module (system flash,
- * option byte keys) is 0.
+ * option byte keys, read-only area) is 0.
  *
  * \param bankSize: Size of a bank of the user flash in bytes (the flash size register is not read here: the
  *        function runs in the NMI and the instruction cache can not be suspended there)
@@ -513,46 +528,67 @@ flash_RequestState_t Flash_Hw_Set_DataSectors( flash_BankId_t bankId, flash_Size
 
 
 /**
- * \brief Reads the number of the high-cycle data sectors of a bank in the option byte to be programmed.
- *
- * \param bankId: Flash bank (0 based)
- *
- * \return Count of the sectors, 0 if disabled or the device has no high-cycle data flash
- */
-flash_Size_t Flash_Hw_Get_DataSectors( flash_BankId_t bankId )
-{
-    flash_Size_t sectorCnt = 0u;
-
-#if defined(FLASH_EDATAR_EDATA_EN)
-    uint32_t regValue;
-
-    if ( 0u == bankId )
-    {
-        regValue = FLASH_NS->EDATA1R_PRG;
-    }
-    else
-    {
-        regValue = FLASH_NS->EDATA2R_PRG;
-    }
-
-    if ( 0u != ( regValue & FLASH_EDATAR_EDATA_EN ) )
-    {
-        sectorCnt = ( ( regValue & FLASH_EDATAR_EDATA_STRT ) >> FLASH_EDATAR_EDATA_STRT_Pos ) + 1u;
-    }
-#else
-    (void)bankId;
-#endif /* FLASH_EDATAR_EDATA_EN */
-
-    return (sectorCnt);
-}
-
-
-/**
  * \brief Starts the programming of the option bytes (the end is signaled by \ref Flash_Hw_Wait_Ready).
  */
 void Flash_Hw_Start_OptionProgram( void )
 {
     FLASH_NS->OPTCR |= FLASH_OPTCR_OPTSTART;
+}
+
+
+/**
+ * \brief Reads the state of TrustZone and the secure watermark of each bank from the option bytes.
+ *
+ * \param state [out]: State of TrustZone
+ *
+ * \note Devices without TrustZone (no FLASH_OPTSR2_TZEN) always report \ref FLASH_FUNCTION_INACTIVE
+ *       and an empty secure watermark; the option bytes are not accessed (RM0481 Rev 5 Section 7.11.23,
+ *       RM0492 has no TZEN option bit).
+ */
+void Flash_Hw_Get_TrustZoneState( flash_TrustZoneState_t * const state )
+{
+#if defined(FLASH_OPTSR2_TZEN)
+    uint32_t       regValue;
+    flash_BankId_t bankId;
+
+    regValue = ( FLASH_NS->OPTSR2_CUR & FLASH_OPTSR2_TZEN ) >> FLASH_OPTSR2_TZEN_Pos;
+
+    if ( FLASH_HW_TZEN_ACTIVE_VALUE == regValue )
+    {
+        state->TzState = FLASH_FUNCTION_ACTIVE;
+    }
+    else
+    {
+        state->TzState = FLASH_FUNCTION_INACTIVE;
+    }
+
+    for ( bankId = 0u; bankId < FLASH_BANK_CNT; bankId++ )
+    {
+        if ( 0u == bankId )
+        {
+            regValue = FLASH_NS->SECWM1R_CUR;
+        }
+        else
+        {
+            regValue = FLASH_NS->SECWM2R_CUR;
+        }
+
+        state->SecureWatermark[ bankId ].StartSector = ( regValue & FLASH_SECWMR_SECWM_STRT )
+                                                         >> FLASH_SECWMR_SECWM_STRT_Pos;
+        state->SecureWatermark[ bankId ].EndSector   = ( regValue & FLASH_SECWMR_SECWM_END )
+                                                         >> FLASH_SECWMR_SECWM_END_Pos;
+    }
+#else
+    flash_BankId_t bankId;
+
+    state->TzState = FLASH_FUNCTION_INACTIVE;
+
+    for ( bankId = 0u; bankId < FLASH_BANK_CNT; bankId++ )
+    {
+        state->SecureWatermark[ bankId ].StartSector = 0u;
+        state->SecureWatermark[ bankId ].EndSector   = 0u;
+    }
+#endif /* FLASH_OPTSR2_TZEN */
 }
 
 /* ========================== LOCAL FUNCTIONS =============================== */
@@ -590,6 +626,10 @@ static flash_Error_t Flash_Hw_Decode_Errors( uint32_t status )
 /**
  * \brief Decodes the address of the word with an ECC error from the ECC register (as the ST HAL does).
  *
+ * The OTP area is decoded with the offset of the device line (STM32H503 reports 0x0200, not the 0x0600 of the
+ * reference manual and the ST HAL, Bug AB#1191); an address of the OTP_ECC group outside of the OTP area (the
+ * read-only area) is not an area of the module and decodes to 0.
+ *
  * \param regValue: Value of the ECC correction or detection register
  * \param bankSize: Size of a bank of the user flash in bytes
  *
@@ -608,7 +648,15 @@ static flash_Address_t Flash_Hw_Decode_EccAddress( uint32_t regValue, flash_Size
 
     if ( 0u != ( regValue & FLASH_ECCR_OTP_ECC ) )
     {
-        address = (flash_Address_t)FLASH_OTP_BASE + ( ( addrReg - FLASH_HW_ECC_OTP_OFFSET ) * FLASH_HW_ECC_WORD_FACTOR );
+        if ( ( FLASH_HW_ECC_OTP_OFFSET <= addrReg ) &&
+             ( ( FLASH_HW_ECC_OTP_OFFSET + FLASH_HW_ECC_OTP_WORD_CNT ) > addrReg )    )
+        {
+            address = (flash_Address_t)FLASH_OTP_BASE + ( ( addrReg - FLASH_HW_ECC_OTP_OFFSET ) * FLASH_HW_ECC_WORD_FACTOR );
+        }
+        else
+        {
+            address = 0u;                                   /* Read-only area (the OTP_ECC flag is shared), not an area of the module */
+        }
     }
     else if ( 0u != ( regValue & FLASH_ECCR_SYSF_ECC ) )
     {
