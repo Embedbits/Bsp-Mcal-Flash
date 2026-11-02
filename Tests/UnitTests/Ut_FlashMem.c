@@ -26,6 +26,17 @@
 /** Value of the erased memory */
 #define UTFLASHMEM_ERASED                   ( 0xFFu )
 
+#if !defined(_WIN32) && \
+    !defined(MAP_FIXED_NOREPLACE)
+#if defined(__APPLE__)
+/** macOS has no such flag: the address is only a hint, the mapped address is checked */
+#define MAP_FIXED_NOREPLACE                 ( 0 )
+#else
+/** Linux headers older than 4.17: the flag is only a hint then, the mapped address is checked */
+#define MAP_FIXED_NOREPLACE                 ( 0x100000 )
+#endif /* __APPLE__ */
+#endif
+
 /* ========================== LOCAL VARIABLES =============================== */
 
 /** Non-zero if the memory is mapped at the required address */
